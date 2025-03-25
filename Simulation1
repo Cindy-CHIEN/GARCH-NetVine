@@ -1,0 +1,306 @@
+############   GOAL   ################
+# CASE1                              #
+# AR(1)-GARCH(1,1) model generate    #
+# 不選股，時間序列應該比iid強        #
+#                                    #
+#                                    #
+######################################
+##================== library =======================##
+library(rugarch)
+library(dplyr)
+library(igraph)
+library(quantmod)
+library(ape)
+library(VineCopula)
+library(network)
+library(StockDistFit)
+library(fBasics)
+library(fGarch)
+library(MASS)
+library(IntroCompFinR)
+library(NMOF)
+##----------------------------------------------------##
+
+##================== set seed =======================##
+set.seed(10000001)
+n <- 500  
+q <- 10
+num_simulations <- 100  # Number of simulations
+
+# -------------------------------------- #
+#### ===== Initialize Storage ===== ####
+all_V <- matrix(NA, nrow = n - 250 + 1, ncol = num_simulations)
+all_V2 <- matrix(NA, nrow = n - 250 + 1, ncol = num_simulations)
+#======== Generate ARMA(1,0)-GARCH(1,1) model =====#
+for (sim in 1:num_simulations) {
+r <- matrix(0, nrow = n, ncol = q) 
+sigma2 <- matrix(0, nrow = n, ncol = q) 
+a <- matrix(0, nrow = n, ncol = q)  
+
+mu <- runif(q, 0.01, 0.1)  # mu
+phi <- runif(q, 0.1, 0.8)  # ar1
+omega <- runif(q, 0, 0.1)  # omega
+gamma <- runif(q, 0.1, 0.15)  # alpha1
+beta <- runif(q, 0.8, 0.9)  # beta1
+
+# 確保 alpha1 + beta1 < 1
+for (i in 1:q) {
+  while ((gamma[i] + beta[i]) >= 1) {
+    gamma[i] <- runif(1, 0.1, 0.15)
+    beta[i] <- runif(1, 0.7, 0.85)
+  }
+}
+
+epsilon<-matrix(rnorm(n * q, 0, 1), nrow = n, ncol = q)
+##=========== 使用 ARMA-GARCH 模型模擬數據 =============##
+for (i in 1:q) {
+  sigma2[1, i] <- omega[i] / (1 - beta[i] - gamma[i]) 
+  a[1, i] <- sqrt(sigma2[1, i]) * epsilon[1, i]     
+  r[1, i] <- mu[i]  
+}
+
+# 模擬每個資產的 AR(1)-GARCH(1,1) 過程
+for (i in 1:q) {
+  for (t in 2:n) {
+    sigma2[t, i] <- omega[i] + beta[i] * a[t-1, i]^2 + gamma[i] * sigma2[t-1, i]  # 波動率平方更新
+    a[t, i] <- sqrt(sigma2[t, i]) * epsilon[t, i] 
+    r[t, i] <- mu[i] + phi[i] * r[t-1, i] + a[t, i] 
+    
+  }
+}
+simdata<- data.frame(r)
+names(simdata) <- paste0("Asset_", 1:q)
+
+head(simdata)
+###---------------------------------------------------------------------------------###
+##========= no degarch ===================##
+data1<-simdata
+
+mea <- list()
+equalWeight <- list()
+equalWeight_mean <- numeric(nrow(data1) - 250)
+tan_weight <- list()
+
+# 定義等權重投資組合（20 隻股票，每隻權重 1/20）
+ew <- rep(1, 10) / 10
+
+# 風險無風險利率
+r.f <- 0.0372 / 250
+
+# 滾動窗口法進行投資組合優化
+for (i in 1:(nrow(data1) - 250)) {
+  # 選擇當前窗口的 250 個觀測值
+  data_window <- data1[i:(249 + i), ]
+  
+  # 計算窗口內的平均收益
+  mean_ret <- colMeans(data_window) 
+  
+  # 計算窗口內的協方差矩陣並進行對角線調整
+  cov_mat <- cov(data_window) + 0.001 * diag(ncol(data_window))
+  
+  # 計算等權重投資組合
+  equalWeight.portfolio <- getPortfolio(er = mean_ret, cov.mat = cov_mat, weights = ew)
+  
+  # 儲存等權重投資組合結果
+  equalWeight[[i]] <- equalWeight.portfolio
+  
+  # 儲存等權重投資組合的平均收益
+  equalWeight_mean[i] <- equalWeight.portfolio$er
+  
+  # 計算切線投資組合
+  tan.port <- tangency.portfolio(mean_ret, cov_mat, r.f, shorts = TRUE)
+  
+  # 提取並儲存切線投資組合的權重
+  tanwei <- tan.port$weights
+  tan_weight[[i]] <- tanwei
+}
+
+# 將所有切線投資組合的權重合併為一個矩陣
+weight_tan <- do.call(rbind, tan_weight)
+
+##---------------------------------------------------------------------------------##
+###============ de-GARCH ==================##
+data2<-simdata
+
+window_size <- 250
+n_stocks <- 10
+
+fit_results <- list()
+degarched_returns <- list()
+fitted_values <- list()
+coeff_list <- list()
+
+for (j in 1:n_stocks) {
+  spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+                     mean.model = list(armaOrder = c(1, 0)),
+                     distribution.model = "norm")
+  fit <- ugarchfit(spec, data = data2[(1:500), j], solver = "hybrid")
+  fit_results[[j]] <- fit
+  coeff_list[[j]] <- coef(fit)
+  r_t <- fitted(fit)
+  fitted_values[[j]] <- r_t
+  degarched_return <- residuals(fit, standardize = TRUE)
+  degarched_returns[[j]] <- degarched_return
+}
+
+# fitts <- do.call(cbind,fitted_values)
+data_degarch <- do.call(cbind, degarched_returns)
+colnames(data_degarch) <- as.character(1:10)
+
+roll1 <- ugarchroll(
+  spec = spec,
+  data = data2,  # 假設 data2 是時間序列數據
+  n.ahead = 1,  # 一步預測
+  forecast.length = 250,  # 預測 250 天
+  solver = 'hybrid',
+  calculate.VaR = FALSE,  # 不生成 VaR 預測
+  n.start = 250,  # 使用前 250 天數據進行初始模型配適
+  refit.every = 1,  # 每隔 1 步重新配適
+  refit.window = 'moving',  # 移動窗口
+  window.size = 250,  # 窗口大小設為 250
+  solver.control = list(tol = 1e-6, trace = 1),
+  fit.control = list(scale = 1)
+)
+
+# 合并 fitted_values 和 roll1 一步预测值
+fitts <- do.call(cbind, fitted_values)
+predicted <- roll1@forecast$density$Mu  # 提取一步预测值
+
+# 在切线投资组合计算中，前250天使用拟合值，后续使用一步预测值
+# Rolling window portfolio optimization with de-GARCHed returns
+mea2 <- list()
+equalWeight2 <- list()
+equalWeight_mean2 <- numeric(nrow(data_degarch) - 250)
+tan_weight2 <- list()
+
+for (i in 1:(nrow(data_degarch) - 250)) {
+  # 根据i的值判断使用拟合值还是预测值
+  if (i <= 250) {
+    data_window <- fitts[i:(249 + i), ]  # 使用拟合值
+  } else {
+    data_window <- predicted[(i - 250):(249 + i - 250), ]  # 使用一步预测值
+  }
+  
+  mean_ret2 <- colMeans(data_window)
+  cov_mat2 <- cov(data_degarch[i:(249 + i), ])
+  
+  equalWeight.portfolio2 <- getPortfolio(er = mean_ret2, cov.mat = cov_mat2, weights = ew)
+  equalWeight2[[i]] <- equalWeight.portfolio2
+  equalWeight_mean2[i] <- equalWeight.portfolio2$er
+  
+  tan_weight_current <- tryCatch({
+    tan.port2 <- tangency.portfolio(mean_ret2, cov_mat2, r.f, shorts = TRUE)
+    tan.port2$weights
+  }, error = function(e) {
+    # If tangency portfolio fails, use global minimum variance portfolio
+    gmin.port2 <- globalMin.portfolio(mean_ret2, cov_mat2)
+    gmin.port2$weights
+  })
+  tan_weight2[[i]] <- tan_weight_current
+}
+
+weight_tan2 <- do.call(rbind, tan_weight2)
+
+
+##=========== return change price ============##
+n=500
+prices1 <- matrix(nrow = n, ncol = 10)
+prices2 <- matrix(nrow = n, ncol = 10)
+
+# 將模擬數據轉換為價格
+for(i in 1:10){
+  prices1[1, i] <- 300
+  prices2[1, i] <- 300
+  
+  for (t in 2:n){
+    prices1[t, i] <- prices1[t-1, i] * (1 + data1[t, i] / 100)
+    prices2[t, i] <- prices2[t-1, i] * (1 + data2[t, i] / 100)
+    
+  }
+}
+
+# 初始化投資組合價值向量
+portfolio_length <- n - 250 + 1  # 1000 - 250 + 1 = 751
+V <- numeric(portfolio_length) 
+V[1] <- 1  # 初始投資組合價值
+
+# 計算第一種情境下的投資組合價值
+for (i in 2:portfolio_length) {
+  V[i] <- sum(weight_tan[i-1, ] * V[i-1] * prices1[249 + i, ] / prices1[248 + i, ])
+}
+
+# 初始化第二種情境下的投資組合價值向量
+V2 <- numeric(portfolio_length) 
+V2[1] <- 1  # 初始投資組合價值
+
+# 計算第二種情境下的投資組合價值
+for (i in 2:portfolio_length) {
+  V2[i] <- sum(weight_tan2[i-1, ] * V2[i-1] * prices2[249 + i, ] / prices2[248 + i, ])
+}
+all_V[, sim] <- V
+all_V2[, sim] <- V2
+}
+
+
+# 繪製投資組合價值變化
+plot(V, type = "l", col = "black", xlab = "Time", ylab = "Portfolio Value",
+     ylim = c(min(V, V2,  na.rm = TRUE), max(V, V2,  na.rm = TRUE)))
+lines(V2, col = "red", type = "l")
+
+legend("topleft", legend = c("PZ method", "deGARCH"),
+       lwd = 1, col = c("black", "red"), cex = 0.6)
+#=====Plot the portfolio value=====#
+
+for (sim in 1:num_simulations) {
+  plot(all_V[, sim], type = "l", col = "black", xlab = "Time", ylab = "Portfolio Value",
+       ylim = c(min(all_V[, sim], all_V2[, sim], na.rm = TRUE), max(all_V[, sim], all_V2[, sim], na.rm = TRUE)),
+       main = paste("Simulation", sim))
+  lines(all_V2[, sim], col = "red", type = "l")
+  
+  #lines(all_V3[, sim],col="blue",type="l")
+  legend("topleft", legend = c( "iid","TS"),
+         lwd = 1, col = c("black","red"),cex=0.8)
+}
+
+time_points <- c(50, 100, 150, 200, 250)
+iid <- all_V[time_points, ]
+ts <- all_V2[time_points, ]
+
+# 計算在相同時間點 de_GARCH 大於 PZ 的次數
+greater_counts <- numeric(length(time_points))  # 儲存每個時間點的次數
+
+for (i in 1:length(time_points)) {
+  greater_counts[i] <- sum(ts[i, ] > iid[i, ])  # 計算大於的次數
+}
+
+# 查看結果
+greater_counts
+# ----------------------------------------------------------------- #
+time_points <- c(50, 100, 150, 200, 250)
+
+iid <- all_V[time_points, ]
+ts <- all_V2[time_points, ]
+
+# Perform paired t-test for each time point
+p_values <- numeric(length(time_points))
+for (i in 1:length(time_points)) {
+  p_values[i] <- t.test(ts[i, ], iid[i, ], paired = TRUE, alternative = "greater")$p.value
+}
+
+# Print p-values for each time point
+names(p_values) <- paste("Time", time_points)
+print(p_values)
+
+
+time_points <- c(50, 100, 150, 200, 250)
+iid <- all_V[time_points, ]
+vine  <- all_V2[time_points, ]
+
+
+p_values2 <- numeric(length(time_points))
+for (i in 1:length(time_points)) {
+  p_values2[i] <- wilcox.test(ts[i, ],iid [i, ], paired = TRUE, alternative = "greater")$p.value
+}
+# Print p-values for each time point
+names(p_values2) <- paste("Time", time_points)
+print(p_values2)
