@@ -1,0 +1,735 @@
+############################################################
+##   R-vine + MST + ARMA-GARCH + rho-grid (完整版本)      ##
+##   covariance 由 R-vine 依公式 (18)(18') 還原 correlation 產生 ##
+############################################################
+
+rm(list = ls())
+gc()
+
+#### ============ 載入必要套件 ================= ####
+library(igraph)
+library(quantmod)
+library(ape)
+library(VineCopula)
+library(network)
+library(rugarch)
+library(StockDistFit)
+library(fBasics)
+library(fGarch)
+library(MASS)
+library(NMOF)
+library(zoo)
+library(sn)
+library(Matrix)
+
+#### ============ 手續費預設值 ================= ####
+fee_default <- 0.0002   # 單趟手續費
+
+#### ============ Tickers & 資料下載 ================= ####
+sp100_tickers <- c(
+  "AAPL","ABBV","ABT","ACN","ADBE","AIG","AMD","AMGN","AMT","AMZN","AVGO","AXP",
+  "BA","BAC","BK","BKNG","BLK","BMY","BRK-B","C","CAT","CHTR","CL","CMCSA","COF",
+  "COP","COST","CRM","CSCO","CVS","CVX","DE","DHR","DIS","DUK","EMR","EXC","F","FDX",
+  "GD","GE","GILD","GM","GOOG","GOOGL","GS","HD","HON","IBM","INTC","JNJ","JPM","KHC",
+  "KO","LIN","LLY","LMT","LOW","MA","MCD","MDLZ","MDT","MET","META","MMM","MO","MRK","MS",
+  "MSFT","NEE","NFLX","NKE","NVDA","ORCL","PEP","PFE","PG","PM","PYPL","QCOM","RTX","SBUX",
+  "SCHW","SO","SPG","T","TGT","TMO","TMUS","TSLA","TXN","UNH","UNP","UPS","USB","V","VZ",
+  "WFC","WMT","XOM"
+)
+
+start_date <- "2019-01-01"
+end_date   <- "2023-12-31"
+
+# 抓股票調整後價格
+getSymbols(sp100_tickers, from = start_date, to = end_date,
+           src = "yahoo", warnings = FALSE, auto.assign = TRUE)
+
+sp_prices <- NULL
+for (sym in sp100_tickers) {
+  sp_prices <- cbind(sp_prices, Ad(get(sym)))
+}
+colnames(sp_prices) <- sp100_tickers
+
+# 每日對數報酬
+log_returns <- diff(log(sp_prices))
+log_returns <- log_returns[complete.cases(log_returns), ]
+
+# Benchmark: OEX
+getSymbols("^OEX", src = "yahoo", from = start_date, to = end_date, auto.assign = TRUE)
+oex_price <- Ad(OEX)
+OEX.rtn   <- oex_price / as.numeric(first(oex_price))
+OEX.rtn   <- na.omit(OEX.rtn)
+OEX.rtn   <- as.zoo(OEX.rtn)
+
+#### ============ 自訂函數：切點投資組合（禁止空頭） ================= ####
+tangency_portfolio_no_short <- function(mean_ret, cov_mat, r_f) {
+  excess_returns <- mean_ret - r_f
+  
+  # 避免奇異矩陣
+  cov_inv <- tryCatch(solve(cov_mat), error = function(e) NULL)
+  if (is.null(cov_inv)) {
+    # fallback：等權
+    w <- rep(1 / length(mean_ret), length(mean_ret))
+    return(w)
+  }
+  
+  num <- cov_inv %*% excess_returns
+  den <- sum(num)
+  
+  if (!is.finite(den) || abs(den) < 1e-12) {
+    w <- rep(1 / length(mean_ret), length(mean_ret))
+    return(w)
+  }
+  
+  w <- as.numeric(num / den)
+  w[!is.finite(w)] <- 0
+  
+  # 禁空
+  w[w < 0] <- 0
+  
+  # 全部被截成 0 時 fallback
+  if (sum(w) <= 0) {
+    w <- rep(1 / length(mean_ret), length(mean_ret))
+  } else {
+    w <- w / sum(w)
+  }
+  
+  return(w)
+}
+
+#### ============ corr2dist：相關係數轉距離 ================= ####
+if (!exists("corr2dist", mode = "function")) {
+  corr2dist <- function(C, method = c("pearson", "kendall")) {
+    method <- match.arg(method)
+    D <- if (method == "pearson") 1 - C^2 else (1 - C) / 2
+    diag(D) <- 0
+    as.dist(D)
+  }
+}
+
+#### ============ adj_to_T1：MST adjacency 轉 T1 邊集合 ================= ####
+if (!exists("adj_to_T1", mode = "function")) {
+  adj_to_T1 <- function(adj) {
+    stopifnot(is.matrix(adj),
+              nrow(adj) == ncol(adj),
+              all(adj == t(adj)),
+              all(diag(adj) == 0))
+    
+    d <- nrow(adj)
+    
+    idx <- which(adj == 1, arr.ind = TRUE)
+    idx <- idx[idx[, "row"] < idx[, "col"], , drop = FALSE]
+    T1_edges <- matrix(as.integer(idx), ncol = 2,
+                       dimnames = list(NULL, c("v1", "v2")))
+    
+    if (nrow(T1_edges) != d - 1)
+      stop("這張圖的邊數不是 d-1，無法成為樹")
+    
+    if (!requireNamespace("igraph", quietly = TRUE))
+      stop("請先安裝 igraph 套件")
+    
+    g <- igraph::graph_from_edgelist(T1_edges, directed = FALSE)
+    if (!igraph::is_connected(g))
+      stop("這張圖不連通，無法成為樹")
+    
+    T1_edges
+  }
+}
+
+# ===============================================================
+#  RVineStructureSelect_fixT1.R
+#  ---------------------------------------------------------------
+#  目的：讓使用者手動固定 R-vine 的第一層 (T1)，後續依舊
+#        使用 RVineStructureSelect() 原生演算法自動建構。
+#  
+# ===============================================================
+
+RVineStructureSelect_fixT1 <- function(data,
+                                       familyset     = NA,
+                                       type          = 0,
+                                       T1_edges,                # ★ 必填：d-1 行 × 2 列矩陣
+                                       selectioncrit = "AIC",
+                                       indeptest     = FALSE,
+                                       level         = 0.05,
+                                       trunclevel    = NA,
+                                       progress      = FALSE,
+                                       weights       = NA,
+                                       treecrit      = "tau",
+                                       rotations     = TRUE,
+                                       se            = FALSE,
+                                       presel        = TRUE,
+                                       method        = "mle",
+                                       cores         = 1) {
+  
+  ## ---------- (0) 把 VineCopula 內部函式綁到區域變數 ----------
+  Vc <- asNamespace("VineCopula")  # 方便寫 Vc$xxx 叫到 :::
+  
+  ## ---------- (1) 參數前處理：沿用原包的 preproc ----------
+  args <- Vc$preproc(
+    c(as.list(environment()), call = match.call()),
+    Vc$check_data,
+    Vc$check_nobs,
+    Vc$check_if_01,
+    Vc$prep_familyset,
+    Vc$check_twoparams)
+  list2env(args, environment())        # 將前處理結果塞回本環境
+  
+  ## ---------- (2) 基本 sanity check ----------
+  d <- ncol(data)
+  stopifnot(d >= 2,
+            nrow(T1_edges) == (d - 1),
+            ncol(T1_edges) == 2)
+  
+  if (type %in% c(0, "RVine")) {
+    type <- "RVine"
+  } else {
+    stop("目前僅支援 R-vine (type = 0)。")
+  }
+  
+  ## ---------- (3) 建立第一層圖形並強制換成使用者的 T1 ----------
+  treecrit <- Vc$set_treecrit(treecrit, familyset)
+  g_full   <- Vc$initializeFirstGraph(data, treecrit, weights)
+  
+  # 將邊轉為 "i,j" 方便比對（i<j）
+  fix_key  <- apply(T1_edges, 1, function(x) paste(sort(x), collapse = ","))
+  all_key  <- apply(g_full$E$nums, 1, function(x) paste(sort(x), collapse = ","))
+  
+  g_full$E$todel <- !(all_key %in% fix_key)   # 非使用者指定邊 → 刪
+  MST <- Vc$deleteEdges(g_full)               # 只剩 d-1 條固定邊
+  
+  # 重新按照 RVine 慣例排序（第二節點優先、再第一節點）
+  ord <- order(MST$E$nums[, 2], MST$E$nums[, 1])
+  MST$E <- lapply(MST$E,
+                  function(x)
+                    if (is.matrix(x)) x[ord, , drop = FALSE] else x[ord])
+  
+  ## ---------- (4) 往下完全沿用原本 RVineStructureSelect() 流程 ----------
+  if (is.na(trunclevel)) trunclevel <- d
+  if (trunclevel == 0) familyset <- 0
+  
+  RVine <- list(Tree = NULL, Graph = NULL)
+  warn  <- NULL
+  
+  # (4a) 第一棵樹：估參數
+  VineTree <- Vc$fit.FirstTreeCopulas(MST, data,
+                                      familyset, selectioncrit,
+                                      indeptest, level,
+                                      weights, se, presel,
+                                      method, cores)
+  if (!is.null(VineTree$warn)) warn <- VineTree$warn
+  RVine$Tree[[1]]  <- VineTree
+  RVine$Graph[[1]] <- g_full         # 存完整圖（含被剔除邊）
+  oldVineGraph     <- VineTree
+  
+  # (4b) 後續樹層
+  for (tree in 2:(d - 1)) {
+    RVine$Tree[[tree - 1]]$E$Copula.CondData.1 <- NULL
+    RVine$Tree[[tree - 1]]$E$Copula.CondData.2 <- NULL
+    
+    if (trunclevel == tree - 1) familyset <- 0
+    g_next <- Vc$buildNextGraph(VineTree, treecrit = treecrit,
+                                weights = weights,
+                                parallel = cores > 1,
+                                truncated = trunclevel < tree)
+    MST    <- Vc$findMaxTree(g_next, mode = type,
+                             truncated = trunclevel < tree)
+    
+    VineTree <- Vc$fit.TreeCopulas(MST, VineTree,
+                                   familyset, selectioncrit,
+                                   indeptest, level,
+                                   progress, weights,
+                                   se, presel, method, cores)
+    
+    if (!is.null(VineTree$warn)) warn <- VineTree$warn
+    RVine$Tree[[tree]]  <- VineTree
+    RVine$Graph[[tree]] <- g_next
+  }
+  
+  ## ---------- (5) 收尾：轉成 RVineMatrix 物件並回傳 ----------
+  if (any(is.na(data)))
+    warning("資料含 NA，已使用 pairwise complete observations。", call. = FALSE)
+  if (!is.null(warn))
+    warning(warn, call. = FALSE)
+  
+  Vc$as.RVM2(RVine, data, match.call())
+}
+
+adj_to_T1 <- function(adj) {
+  stopifnot(is.matrix(adj),           # 正方形且對稱
+            nrow(adj) == ncol(adj),
+            all(adj == t(adj)),
+            all(diag(adj) == 0))
+  
+  d <- nrow(adj)
+  
+  # 取上三角的 1 → 邊集
+  idx <- which(adj == 1, arr.ind = TRUE)
+  idx <- idx[idx[, "row"] < idx[, "col"], , drop = FALSE]
+  T1_edges <- matrix(as.integer(idx), ncol = 2,
+                     dimnames = list(NULL, c("v1", "v2")))
+  
+  # -------- 合法性：邊數 d-1 且連通 -----------------
+  if (nrow(T1_edges) != d - 1)
+    stop("這張圖的邊數不是 d-1，無法成為樹")
+  
+  if (!requireNamespace("igraph", quietly = TRUE))
+    stop("請先安裝 igraph 套件")
+  
+  g <- igraph::graph_from_edgelist(T1_edges, directed = FALSE)
+  if (!igraph::is_connected(g))       # 新名字
+    stop("這張圖不連通，無法成為樹")
+  
+  T1_edges                           # 全部檢查通過，回傳
+}
+
+
+
+
+
+
+#### ============ R-vine conditional rho 還原 correlation matrix ============ ####
+# 穩定版：依 RVineMatrix tree order 逐層讀取 pair-copula 的 conditional rho，
+# 再用公式 (18') 消去 conditioning variables，還原 unconditional correlation matrix。
+# 建議先使用 familyset = 1，也就是 Gaussian copula，因為 par 本身就是 partial correlation。
+
+clip_rho <- function(x, eps = 1e-8) {
+  if (!is.finite(x)) x <- 0
+  max(min(x, 1 - eps), -1 + eps)
+}
+
+rho_key <- function(i, j, S = integer(0)) {
+  ij <- sort(as.integer(c(i, j)))
+  S  <- sort(as.integer(S))
+  paste0(ij[1], ',', ij[2], '|', paste(S, collapse = ','))
+}
+
+bicop_to_cond_rho <- function(family, par, par2 = 0) {
+  if (!is.finite(family) || family == 0) return(0)
+
+  # Gaussian / Student-t copula：VineCopula 的 par 就是 rho
+  if (family %in% c(1, 2)) {
+    return(clip_rho(par))
+  }
+
+  # 其他 copula family：par 不是 correlation，只能用 Kendall tau 轉 pseudo-rho
+  tau <- tryCatch(
+    VineCopula::BiCopPar2Tau(family = family, par = par, par2 = par2),
+    error = function(e) NA_real_
+  )
+
+  clip_rho(sin(pi * tau / 2))
+}
+
+recover_corr_from_rvine_formula <- function(RVM, var_names = NULL) {
+
+  M      <- RVM$Matrix
+  family <- RVM$family
+  par    <- RVM$par
+  par2   <- RVM$par2
+
+  d <- ncol(M)
+  rho_env <- new.env(parent = emptyenv())
+
+  get_known <- function(i, j, S = integer(0)) {
+    key <- rho_key(i, j, S)
+    if (exists(key, envir = rho_env, inherits = FALSE)) {
+      return(rho_env[[key]])
+    }
+    NA_real_
+  }
+
+  set_known <- function(i, j, S, val) {
+    rho_env[[rho_key(i, j, S)]] <- clip_rho(val)
+  }
+
+  # RVineMatrix 讀法：
+  # tree = 1, ..., d-1
+  # row  = d - tree
+  # pair-copula edge 對應：rho_{ M[row+1,col], M[row,col] | M[(row+2):d,col] }
+  for (tree in 1:(d - 1)) {
+    row <- d - tree
+
+    for (col in 1:(d - tree)) {
+      i <- M[row + 1, col]
+      j <- M[row, col]
+
+      if (tree == 1) {
+        S_order <- integer(0)
+      } else {
+        S_order <- M[(row + 2):d, col]
+      }
+
+      fam <- family[row, col]
+      p1  <- par[row, col]
+      p2  <- par2[row, col]
+
+      rho_current <- bicop_to_cond_rho(fam, p1, p2)
+
+      # 記錄 vine edge 本身的 conditional rho
+      set_known(i, j, S_order, rho_current)
+
+      # tree 1 本身就是 unconditional rho
+      if (length(S_order) == 0) next
+
+      # 公式 (18')：
+      # rho_{ij|L} = rho_{ij|kL} sqrt((1-rho_{ik|L}^2)(1-rho_{jk|L}^2)) + rho_{ik|L} rho_{jk|L}
+      # 不能任意選 k；先依 RVineMatrix 給定的 conditioning order 消元。
+      S_current <- as.integer(S_order)
+
+      while (length(S_current) > 0) {
+        # 優先從前端消 k
+        k  <- S_current[1]
+        L0 <- if (length(S_current) > 1) S_current[-1] else integer(0)
+
+        rho_ik_L <- get_known(i, k, L0)
+        rho_jk_L <- get_known(j, k, L0)
+
+        # 若前端找不到，改從尾端消 k
+        if (!is.finite(rho_ik_L) || !is.finite(rho_jk_L)) {
+          k  <- S_current[length(S_current)]
+          L0 <- if (length(S_current) > 1) S_current[-length(S_current)] else integer(0)
+          rho_ik_L <- get_known(i, k, L0)
+          rho_jk_L <- get_known(j, k, L0)
+        }
+
+        # 若仍找不到，代表該 RVineMatrix ordering 與公式消元順序不完全相容。
+        # 不中斷主程式；最後缺失的 unconditional rho 會設為 0 並 nearPD 修正。
+        if (!is.finite(rho_ik_L) || !is.finite(rho_jk_L)) {
+          warning(sprintf(
+            '無法找到側邊 partial rho：(%s,%s|%s) 或 (%s,%s|%s)，該 edge 略過公式還原。',
+            i, k, paste(L0, collapse = ','),
+            j, k, paste(L0, collapse = ',')
+          ))
+          break
+        }
+
+        rho_next <- rho_current *
+          sqrt((1 - rho_ik_L^2) * (1 - rho_jk_L^2)) +
+          rho_ik_L * rho_jk_L
+
+        rho_next <- clip_rho(rho_next)
+        set_known(i, j, L0, rho_next)
+
+        rho_current <- rho_next
+        S_current <- as.integer(L0)
+      }
+    }
+  }
+
+  Psi <- diag(1, d)
+
+  for (a in 1:(d - 1)) {
+    for (b in (a + 1):d) {
+      val <- get_known(a, b, integer(0))
+
+      if (!is.finite(val)) {
+        warning(sprintf('unconditional rho(%s,%s) 不存在，設為 0。', a, b))
+        val <- 0
+      }
+
+      Psi[a, b] <- Psi[b, a] <- clip_rho(val)
+    }
+  }
+
+  Psi[!is.finite(Psi)] <- 0
+  diag(Psi) <- 1
+
+  # 數值誤差修正：投影到最近正定 correlation matrix
+  ev <- eigen(Psi, symmetric = TRUE, only.values = TRUE)$values
+  if (min(ev, na.rm = TRUE) <= 1e-8) {
+    Psi <- as.matrix(Matrix::nearPD(Psi, corr = TRUE)$mat)
+  }
+
+  if (!is.null(var_names) && length(var_names) == d) {
+    rownames(Psi) <- colnames(Psi) <- var_names
+  }
+
+  Psi
+}
+
+#### ============ AUC（以日期 + value 計算面積） ================= ####
+AUC <- function(dates, values) {
+  t <- as.numeric(dates)
+  y <- as.numeric(values)
+  if (length(t) < 2 || length(y) < 2) return(NA_real_)
+  sum(diff(t) * (head(y, -1) + tail(y, -1)) / 2)
+}
+
+#### ============ 主函數：simulate_portfolio_ec ================= ####
+simulate_portfolio_ec <- function(corr_method = c("pearson", "kendall"),
+                                  selection   = c("auto", "highest", "lowest"),
+                                  rho_th      = 0.2,
+                                  fee         = fee_default,
+                                  est_length  = 250,
+                                  hold_length = 62,
+                                  shift       = 63,
+                                  top_n       = 20,
+                                  familyset   = 1,
+                                  n_sim_corr  = 5000,
+                                  rf_annual   = 0.0372) {
+  
+  corr_method <- match.arg(corr_method)
+  selection   <- match.arg(selection)
+  
+  prices <- sp_prices
+  n_days <- nrow(prices)
+  
+  current_value    <- 1
+  portfolio_values <- numeric()
+  portfolio_dates  <- as.Date(character())
+  adj_list         <- list()
+  
+  rho_vec  <- numeric()
+  sel_vec  <- character()
+  pick_vec <- list()
+  
+  i <- 0
+  cycle <- 1
+  
+  repeat {
+    est_start  <- 1 + i * shift
+    est_end    <- est_start + est_length - 1
+    hold_start <- est_end + 1
+    hold_end   <- hold_start + hold_length - 1
+    
+    if (est_end > nrow(log_returns) || hold_end > n_days) break
+    
+    ## ---------- (1) ARMA-GARCH：de-GARCH 殘差 + forecast 均值 ----------
+    degarch_mat <- matrix(NA, est_length, length(sp100_tickers))
+    colnames(degarch_mat) <- sp100_tickers
+    
+    mu_next_vec <- rep(NA_real_, length(sp100_tickers))
+    names(mu_next_vec) <- sp100_tickers
+    
+    for (j in seq_along(sp100_tickers)) {
+      x <- as.numeric(log_returns[est_start:est_end, j])
+      
+      if (all(!is.finite(x)) || sd(x, na.rm = TRUE) == 0) {
+        degarch_mat[, j] <- 0
+        mu_next_vec[j]   <- 0
+        next
+      }
+      
+      best_aic <- Inf
+      best_fit <- NULL
+      
+      for (p in 1:2) for (q in 1:2) for (m in 0:3) for (n in 0:3) {
+        spec <- ugarchspec(
+          variance.model = list(model = "sGARCH", garchOrder = c(p, q)),
+          mean.model     = list(armaOrder = c(m, n)),
+          distribution.model = "sstd"
+        )
+        
+        fit <- tryCatch(
+          ugarchfit(spec, data = x, solver = "hybrid", silent = TRUE),
+          error = function(e) NULL
+        )
+        
+        if (!is.null(fit)) {
+          aic <- tryCatch(infocriteria(fit)["Akaike", 1], error = function(e) Inf)
+          if (!is.na(aic) && is.finite(aic) && aic < best_aic) {
+            best_aic <- aic
+            best_fit <- fit
+          }
+        }
+      }
+      
+      if (!is.null(best_fit)) {
+        degarch_mat[, j] <- as.numeric(residuals(best_fit, standardize = TRUE))
+        
+        fc <- tryCatch(
+          ugarchforecast(best_fit, n.ahead = 1),
+          error = function(e) NULL
+        )
+        
+        if (!is.null(fc)) {
+          mu_next_vec[j] <- as.numeric(fc@forecast$seriesFor[1])
+        } else {
+          mu_next_vec[j] <- mean(x, na.rm = TRUE)
+        }
+      } else {
+        # fallback
+        sx <- sd(x, na.rm = TRUE)
+        if (!is.finite(sx) || sx <= 0) sx <- 1
+        degarch_mat[, j] <- (x - mean(x, na.rm = TRUE)) / sx
+        mu_next_vec[j]   <- mean(x, na.rm = TRUE)
+      }
+    }
+    
+    est_resid <- degarch_mat
+    
+    ## ---------- (2) 全市場 MST + eigen-centrality ----------
+    C_all <- cor(est_resid, use = "pairwise.complete.obs", method = corr_method)
+    C_all[!is.finite(C_all)] <- 0
+    diag(C_all) <- 1
+    
+    D_all <- corr2dist(C_all, corr_method)
+    mst_all <- as.matrix(ape::mst(D_all))
+    
+    g_all <- igraph::graph_from_adjacency_matrix(
+      mst_all,
+      mode = "undirected",
+      weighted = TRUE
+    )
+    
+    ec <- igraph::eigen_centrality(g_all)$vector
+    
+    ## ---------- (3) rho decision rule ----------
+    ret_est <- log_returns[est_start:est_end, ]
+    r_f <- rf_annual / 250
+    
+    mu_i <- colMeans(ret_est, na.rm = TRUE)
+    sd_i <- apply(ret_est, 2, sd, na.rm = TRUE)
+    SR   <- (mu_i - r_f) / sd_i
+    SR[!is.finite(SR)] <- NA_real_
+    
+    common <- intersect(names(ec), names(SR))
+    rho <- cor(SR[common], ec[common], use = "pairwise.complete.obs")
+    
+    selection_eff <- selection
+    if (selection == "auto") {
+      selection_eff <- ifelse(!is.na(rho) && rho > rho_th, "lowest", "highest")
+    }
+    
+    ## ---------- (4) 選股 ----------
+    pick <- if (selection_eff == "highest") {
+      names(sort(ec, decreasing = TRUE))[1:top_n]
+    } else {
+      names(sort(ec, decreasing = FALSE))[1:top_n]
+    }
+    
+    rho_vec[cycle]   <- rho
+    sel_vec[cycle]   <- selection_eff
+    pick_vec[[cycle]] <- pick
+    
+    ## ---------- (5) 對選到的股票重建 MST ----------
+    C_sub <- cor(est_resid[, pick, drop = FALSE],
+                 use = "pairwise.complete.obs",
+                 method = corr_method)
+    C_sub[!is.finite(C_sub)] <- 0
+    diag(C_sub) <- 1
+    
+    D_sub   <- corr2dist(C_sub, corr_method)
+    mst_sub <- as.matrix(ape::mst(D_sub))
+    adj_sel <- mst_sub
+    adj_list[[cycle]] <- adj_sel
+    
+    T1_edges <- adj_to_T1(adj_sel)
+    
+    cat(sprintf("Cycle %d (%s): rho = %.4f, th = %.2f => %s centrality\n",
+                cycle, corr_method, rho, rho_th, selection_eff))
+    cat(sprintf("Pick: %s\n", paste(pick, collapse = ", ")))
+    
+    ## ---------- (6) Vine 模型（第一層依 MST 強制接線） ----------
+    resid_sub <- est_resid[, pick, drop = FALSE]
+    u_data    <- pobs(resid_sub)
+    
+    vine_mod <- RVineStructureSelect_fixT1(
+      data          = u_data,
+      familyset     = familyset,
+      T1_edges      = T1_edges,
+      selectioncrit = "AIC"
+    )
+    
+    ## ---------- (7) 用公式 (18)(18') 從 R-vine 還原 correlation ----------
+    # 不再使用 RVineSim() 模擬；直接由 pair-copula conditional rho 遞迴還原 Psi。
+    corr_vine <- recover_corr_from_rvine_formula(vine_mod, var_names = pick)
+    corr_vine[!is.finite(corr_vine)] <- 0
+    diag(corr_vine) <- 1
+    
+    # 用殘差標準差重建 covariance
+    sigma_vec <- apply(resid_sub, 2, sd, na.rm = TRUE)
+    sigma_vec[!is.finite(sigma_vec) | sigma_vec <= 0] <- 1
+    
+    D_sigma <- diag(sigma_vec)
+    cov_mat <- D_sigma %*% corr_vine %*% D_sigma
+    
+    ## ---------- (8) 預期報酬：ARMA-GARCH 下一期 forecast ----------
+    mean_fore <- mu_next_vec[pick]
+    
+    if (anyNA(mean_fore)) {
+      na_idx <- which(is.na(mean_fore))
+      for (k in na_idx) {
+        stk <- pick[k]
+        mean_fore[k] <- mean(log_returns[est_start:est_end, stk], na.rm = TRUE)
+      }
+    }
+    
+    mean_fore[!is.finite(mean_fore)] <- 0
+    
+    ## ---------- (9) 切點權重 ----------
+    wts <- tangency_portfolio_no_short(mean_fore, cov_mat, r_f)
+    
+    ## ---------- (10) 持有期回測 ----------
+    pr0 <- as.numeric(prices[est_end, pick])
+    pr1 <- as.numeric(prices[hold_start, pick])
+    
+    V0 <- current_value * sum(wts * (pr1 / pr0)) * (1 - fee)
+    
+    vals <- numeric(hold_length)
+    vals[1] <- V0
+    
+    if (hold_length >= 2) {
+      for (t in (hold_start + 1):hold_end) {
+        pr_t0 <- as.numeric(prices[t - 1, pick])
+        pr_t1 <- as.numeric(prices[t, pick])
+        vals[t - hold_start + 1] <- vals[t - hold_start] *
+          sum(wts * (pr_t1 / pr_t0))
+      }
+    }
+    
+    current_value    <- vals[hold_length]
+    portfolio_values <- c(portfolio_values, vals)
+    portfolio_dates  <- c(portfolio_dates, index(prices)[hold_start:hold_end])
+    
+    message(sprintf("Cycle %d done. value = %.4f", cycle, current_value))
+    
+    i <- i + 1
+    cycle <- cycle + 1
+  }
+  
+  list(
+    dates  = as.Date(portfolio_dates),
+    values = portfolio_values,
+    adj    = adj_list,
+    rho    = rho_vec,
+    sel    = sel_vec,
+    pick   = pick_vec
+  )
+}
+
+#### ============ threshold sweep：rho_th in grid ================= ####
+rho_grid <- seq(0, 0.2, by = 0.1)
+
+run_one_th <- function(th, corr_method = "pearson", seed = 123) {
+  set.seed(seed)
+  
+  out <- simulate_portfolio_ec(
+    corr_method = corr_method,
+    selection   = "auto",
+    rho_th      = th,
+    fee         = fee_default,
+    est_length  = 250,
+    hold_length = 62,
+    shift       = 63,
+    top_n       = 20,
+    familyset   = 1,
+    n_sim_corr  = 5000
+  )
+  
+  if (length(out$values) < 2) return(NA_real_)
+  AUC(out$dates, out$values)
+}
+
+#### ============ 跑 rho-grid sweep ================= ####
+set.seed(123)
+
+#auc_P <- sapply(rho_grid, run_one_th, corr_method = "pearson", seed = 123)
+auc_K <- sapply(r ho_grid, run_one_th, corr_method = "kendall", seed = 112285003)
+
+auc_tbl <- data.frame(
+  rho_th = rho_grid,
+  AUC_Kendall = auc_K
+)
+
+print(auc_tbl)
