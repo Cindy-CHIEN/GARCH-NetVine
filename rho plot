@@ -1,0 +1,579 @@
+############################
+# 0. Packages
+############################
+required_pkgs <- c("quantmod", "xts", "zoo", "lubridate", "rugarch", "igraph", "ape")
+new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
+if (length(new_pkgs) > 0) install.packages(new_pkgs)
+
+library(quantmod)
+library(xts)
+library(zoo)
+library(lubridate)
+library(rugarch)
+library(igraph)
+library(ape)
+
+############################
+# 1. User settings
+############################
+set.seed(112285003)
+fee_default <- 0.0002
+
+sp100_tickers <- c(
+  "AAPL","ABBV","ABT","ACN","ADBE","AIG","AMD","AMGN","AMT","AMZN","AVGO","AXP",
+  "BA","BAC","BK","BKNG","BLK","BMY","BRK-B","C","CAT","CHTR","CL","CMCSA","COF",
+  "COP","COST","CRM","CSCO","CVS","CVX","DE","DHR","DIS","DUK","EMR","EXC","F","FDX",
+  "GD","GE","GILD","GM","GOOG","GOOGL","GS","HD","HON","IBM","INTC","JNJ","JPM","KHC",
+  "KO","LIN","LLY","LMT","LOW","MA","MCD","MDLZ","MDT","MET","META","MMM","MO","MRK","MS",
+  "MSFT","NEE","NFLX","NKE","NVDA","ORCL","PEP","PFE","PG","PM","PYPL","QCOM","RTX","SBUX",
+  "SCHW","SO","SPG","T","TGT","TMO","TMUS","TSLA","TXN","UNH","UNP","UPS","USB","V","VZ",
+  "WFC","WMT","XOM"
+)
+
+start_date <- "2019-01-01"
+end_date   <- "2023-12-31"
+
+window_months <- 12
+step_months   <- 3
+min_obs       <- 150
+
+# 畫圖用 threshold，只是畫線與標色，不會影響 rho 計算
+rho_star <- 0.20
+
+# 垂直分隔線位置，可自行改
+vlines_at <- c(4, 8, 12, 16)
+
+############################
+# 2. Helper functions
+############################
+
+# corr -> distance
+if (!exists("corr2dist", mode = "function")) {
+  corr2dist <- function(C, method = c("pearson", "kendall")) {
+    method <- match.arg(method)
+    D <- if (method == "pearson") 1 - C^2 else (1 - C) / 2
+    diag(D) <- 0
+    as.dist(D)
+  }
+}
+
+# de-GARCH standardized residuals
+get_std_resid <- function(x) {
+  x <- as.numeric(x)
+  
+  if (sum(is.finite(x)) < 100) {
+    return(rep(NA_real_, length(x)))
+  }
+  
+  spec <- ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+    mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),
+    distribution.model = "norm"
+  )
+  
+  fit <- tryCatch(
+    ugarchfit(spec = spec, data = x, solver = "hybrid", silent = TRUE),
+    error = function(e) NULL
+  )
+  
+  if (is.null(fit)) {
+    return(rep(NA_real_, length(x)))
+  }
+  
+  res <- tryCatch(
+    as.numeric(residuals(fit, standardize = TRUE)),
+    error = function(e) rep(NA_real_, length(x))
+  )
+  
+  if (length(res) != length(x)) {
+    return(rep(NA_real_, length(x)))
+  }
+  
+  res
+}
+
+# 單一 cycle 計算
+compute_cycle_rho_mst <- function(ret_window_xts, min_obs = 150) {
+  
+  R <- coredata(ret_window_xts)
+  colnames(R) <- colnames(ret_window_xts)
+  
+  # 先留資料夠多的股票
+  keep1 <- colSums(is.finite(R)) >= min_obs
+  R <- R[, keep1, drop = FALSE]
+  
+  if (ncol(R) < 5) {
+    return(list(
+      n_stocks = ncol(R),
+      rho_pearson = NA_real_,
+      rho_kendall = NA_real_,
+      sr = NULL,
+      ec_pearson = NULL,
+      ec_kendall = NULL
+    ))
+  }
+  
+  # de-GARCH residuals
+  resid_mat <- matrix(NA_real_, nrow = nrow(R), ncol = ncol(R))
+  colnames(resid_mat) <- colnames(R)
+  
+  for (j in seq_len(ncol(R))) {
+    resid_mat[, j] <- get_std_resid(R[, j])
+  }
+  
+  # 再篩一次
+  keep2 <- colSums(is.finite(resid_mat)) >= min_obs
+  resid_mat <- resid_mat[, keep2, drop = FALSE]
+  R <- R[, keep2, drop = FALSE]
+  
+  if (ncol(R) < 5) {
+    return(list(
+      n_stocks = ncol(R),
+      rho_pearson = NA_real_,
+      rho_kendall = NA_real_,
+      sr = NULL,
+      ec_pearson = NULL,
+      ec_kendall = NULL
+    ))
+  }
+  
+  # 只保留完整列
+  cc <- complete.cases(resid_mat)
+  resid_mat <- resid_mat[cc, , drop = FALSE]
+  R <- R[cc, , drop = FALSE]
+  
+  if (nrow(resid_mat) < min_obs || ncol(resid_mat) < 5) {
+    return(list(
+      n_stocks = ncol(R),
+      rho_pearson = NA_real_,
+      rho_kendall = NA_real_,
+      sr = NULL,
+      ec_pearson = NULL,
+      ec_kendall = NULL
+    ))
+  }
+  
+  # stock-level Sharpe ratio
+  sr <- apply(R, 2, function(x) {
+    s <- sd(x, na.rm = TRUE)
+    m <- mean(x, na.rm = TRUE)
+    if (!is.finite(s) || s == 0) return(NA_real_)
+    m / s
+  })
+  
+  # ---------- Pearson network ----------
+  C_p <- cor(resid_mat, use = "pairwise.complete.obs", method = "pearson")
+  C_p[!is.finite(C_p)] <- 0
+  diag(C_p) <- 1
+  
+  D_p <- corr2dist(C_p, method = "pearson")
+  mst_p <- as.matrix(ape::mst(D_p))
+  
+  g_p <- igraph::graph_from_adjacency_matrix(
+    mst_p,
+    mode = "undirected",
+    weighted = TRUE,
+    diag = FALSE
+  )
+  
+  ec_p <- tryCatch(
+    igraph::eigen_centrality(g_p, directed = FALSE, weights = igraph::E(g_p)$weight)$vector,
+    error = function(e) NULL
+  )
+  
+  # ---------- Kendall network ----------
+  C_k <- cor(resid_mat, use = "pairwise.complete.obs", method = "kendall")
+  C_k[!is.finite(C_k)] <- 0
+  diag(C_k) <- 1
+  
+  D_k <- corr2dist(C_k, method = "kendall")
+  mst_k <- as.matrix(ape::mst(D_k))
+  
+  g_k <- igraph::graph_from_adjacency_matrix(
+    mst_k,
+    mode = "undirected",
+    weighted = TRUE,
+    diag = FALSE
+  )
+  
+  ec_k <- tryCatch(
+    igraph::eigen_centrality(g_k, directed = FALSE, weights = igraph::E(g_k)$weight)$vector,
+    error = function(e) NULL
+  )
+  
+  # 對齊名稱
+  rho_p <- NA_real_
+  rho_k <- NA_real_
+  
+  if (!is.null(ec_p)) {
+    common_p <- intersect(names(sr), names(ec_p))
+    sr_p <- sr[common_p]
+    ec_p2 <- ec_p[common_p]
+    ok_p <- complete.cases(sr_p, ec_p2)
+    sr_p <- sr_p[ok_p]
+    ec_p2 <- ec_p2[ok_p]
+    
+    if (length(sr_p) >= 5) {
+      rho_p <- suppressWarnings(cor(sr_p, ec_p2, method = "pearson"))
+    }
+  }
+  
+  if (!is.null(ec_k)) {
+    common_k <- intersect(names(sr), names(ec_k))
+    sr_k <- sr[common_k]
+    ec_k2 <- ec_k[common_k]
+    ok_k <- complete.cases(sr_k, ec_k2)
+    sr_k <- sr_k[ok_k]
+    ec_k2 <- ec_k2[ok_k]
+    
+    if (length(sr_k) >= 5) {
+      rho_k <- suppressWarnings(cor(sr_k, ec_k2, method = "kendall"))
+    }
+  }
+  
+  list(
+    n_stocks = length(sr),
+    rho_pearson = rho_p,
+    rho_kendall = rho_k,
+    sr = sr,
+    ec_pearson = ec_p,
+    ec_kendall = ec_k
+  )
+}
+
+############################
+# 3. Download data
+############################
+getSymbols(sp100_tickers,
+           from = start_date,
+           to = end_date,
+           src = "yahoo",
+           warnings = FALSE,
+           auto.assign = TRUE)
+
+sp_prices <- NULL
+valid_symbols <- c()
+
+for (sym in sp100_tickers) {
+  obj <- tryCatch(get(sym), error = function(e) NULL)
+  if (!is.null(obj)) {
+    sp_prices <- cbind(sp_prices, Ad(obj))
+    valid_symbols <- c(valid_symbols, sym)
+  }
+}
+
+colnames(sp_prices) <- valid_symbols
+
+# daily log returns
+log_returns <- diff(log(sp_prices))
+log_returns <- log_returns[complete.cases(log_returns), ]
+
+cat("Data loaded.\n")
+cat("Tickers used:", ncol(log_returns), "\n")
+cat("Date range:", as.character(start(log_returns)), "to", as.character(end(log_returns)), "\n\n")
+
+############################
+# 4. Rolling calculation
+############################
+start_dates <- seq.Date(
+  from = as.Date(start_date),
+  to   = as.Date(end_date) %m-% months(window_months) + days(1),
+  by   = paste(step_months, "months")
+)
+
+rho_results <- data.frame(
+  cycle = integer(),
+  start = as.Date(character()),
+  end = as.Date(character()),
+  n_stocks = integer(),
+  rho_pearson = numeric(),
+  rho_kendall = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_along(start_dates)) {
+  s <- start_dates[i]
+  e <- s %m+% months(window_months) - days(1)
+  
+  ret_window <- log_returns[paste0(s, "/", e)]
+  
+  out <- compute_cycle_rho_mst(ret_window, min_obs = min_obs)
+  
+  rho_results <- rbind(
+    rho_results,
+    data.frame(
+      cycle = i,
+      start = s,
+      end = e,
+      n_stocks = out$n_stocks,
+      rho_pearson = out$rho_pearson,
+      rho_kendall = out$rho_kendall
+    )
+  )
+  
+  cat(sprintf(
+    "Cycle %d done. [%s to %s] Pearson = %.4f, Kendall = %.4f, n = %d\n",
+    i, as.character(s), as.character(e),
+    out$rho_pearson, out$rho_kendall, out$n_stocks
+  ))
+}
+
+cat("\nFinal rho results:\n")
+print(rho_results)
+
+############################
+# 5. Plot
+############################
+plot_two_panel <- function(df, rho_star = 0.20, vlines = NULL) {
+  
+  oldpar <- par(no.readonly = TRUE)
+  on.exit(par(oldpar))
+  
+  par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+  
+  ylim_all <- range(c(df$rho_pearson, df$rho_kendall, rho_star, 0), na.rm = TRUE)
+  ylim_all <- ylim_all + c(-0.03, 0.03)
+  
+  # ----- Pearson -----
+  grp_p <- ifelse(df$rho_pearson > rho_star, "H", "L")
+  
+  plot(df$cycle, df$rho_pearson,
+       type = "l",
+       col = "royalblue4",
+       lwd = 1,
+       xlab = "Cycle",
+       ylab = expression(rho(SR, C)),
+       main = expression(rho(SR, C) ~ "\u2013 Pearson"),
+       ylim = ylim_all)
+  
+  points(df$cycle[grp_p == "H"], df$rho_pearson[grp_p == "H"],
+         pch = 16, col = "blue", cex = 0.8)
+  points(df$cycle[grp_p == "L"], df$rho_pearson[grp_p == "L"],
+         pch = 16, col = "orange", cex = 0.8)
+  
+  abline(h = 0, col = "royalblue4", lwd = 1)
+  #abline(h = rho_star, col = "firebrick", lty = 2, lwd = 1)
+  
+  if (!is.null(vlines)) {
+    abline(v = vlines, col = "grey60", lty = 2)
+  }
+  
+  # ----- Kendall -----
+  grp_k <- ifelse(df$rho_kendall > rho_star, "H", "L")
+  
+  plot(df$cycle, df$rho_kendall,
+       type = "l",
+       col = "goldenrod3",
+       lwd = 1,
+       xlab = "Cycle",
+       ylab = expression(rho(SR, C)),
+       main = expression(rho(SR, C) ~ "\u2013 Kendall"),
+       ylim = ylim_all)
+  
+  points(df$cycle[grp_k == "H"], df$rho_kendall[grp_k == "H"],
+         pch = 16, col = "blue", cex = 0.8)
+  points(df$cycle[grp_k == "L"], df$rho_kendall[grp_k == "L"],
+         pch = 16, col = "orange", cex = 0.8)
+  
+  abline(h = 0, col = "royalblue4", lwd = 1)
+  #abline(h = rho_star, col = "firebrick", lty = 2, lwd = 1)
+  
+  if (!is.null(vlines)) {
+    abline(v = vlines, col = "grey60", lty = 2)
+  }
+  
+  # legend("topright",
+  #        legend = c("High centrality (H)", "Low centrality (L)", "rho threshold"),
+  #        col = c("blue", "orange", "firebrick"),
+  #        pch = c(16, 16, NA),
+  #        lty = c(NA, NA, 2),
+  #        bty = "n",
+  #        cex = 0.9)
+}
+
+plot_two_panel(rho_results, rho_star = rho_star, vlines = vlines_at)
+
+
+plot_two_panel_year <- function(df, rho_star = 0.20, vlines = NULL) {
+  
+  oldpar <- par(no.readonly = TRUE)
+  on.exit(par(oldpar))
+  
+  par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+  
+  # 確保日期格式正確
+  df$start <- as.Date(df$start)
+  df$end   <- as.Date(df$end)
+  
+  # 用 end date 當作每個點的時間位置
+  x_date <- df$end
+  
+  ylim_all <- range(c(df$rho_pearson, df$rho_kendall, rho_star, 0), na.rm = TRUE)
+  ylim_all <- ylim_all + c(-0.03, 0.03)
+  
+  # 年份刻度
+  x_min <- min(x_date, na.rm = TRUE)
+  x_max <- max(x_date, na.rm = TRUE)
+  
+  year_ticks <- seq(
+    from = as.Date(paste0(format(x_min, "%Y"), "-01-01")),
+    to   = as.Date(paste0(format(x_max, "%Y"), "-01-01")),
+    by   = "1 year"
+  )
+  
+  # vlines 如果給的是 cycle，就轉成對應 end date
+  if (!is.null(vlines)) {
+    if (is.numeric(vlines)) {
+      vline_dates <- x_date[vlines[vlines >= 1 & vlines <= nrow(df)]]
+    } else {
+      vline_dates <- as.Date(vlines)
+    }
+  } else {
+    vline_dates <- NULL
+  }
+  
+  # ---------- Pearson ----------
+  grp_p <- ifelse(df$rho_pearson > rho_star, "H", "L")
+  
+  plot(x_date, df$rho_pearson,
+       type = "l",
+       col = "royalblue4",
+       lwd = 1,
+       xlab = "Year",
+       ylab = expression(rho(SR, C)),
+       main = expression(rho(SR, C) ~ "\u2013 Pearson"),
+       ylim = ylim_all,
+       xaxt = "n")
+  
+  axis(1, at = year_ticks, labels = format(year_ticks, "%Y"))
+  
+  points(x_date[grp_p == "H"], df$rho_pearson[grp_p == "H"],
+         pch = 16, col = "blue", cex = 0.8)
+  points(x_date[grp_p == "L"], df$rho_pearson[grp_p == "L"],
+         pch = 16, col = "orange", cex = 0.8)
+  
+  abline(h = 0, col = "royalblue4", lwd = 1)
+  
+  if (!is.null(vline_dates)) {
+    abline(v = vline_dates, col = "grey60", lty = 2)
+  }
+  
+  # ---------- Kendall ----------
+  grp_k <- ifelse(df$rho_kendall > rho_star, "H", "L")
+  
+  plot(x_date, df$rho_kendall,
+       type = "l",
+       col = "goldenrod3",
+       lwd = 1,
+       xlab = "Year",
+       ylab = expression(rho(SR, C)),
+       main = expression(rho(SR, C) ~ "\u2013 Kendall"),
+       ylim = ylim_all,
+       xaxt = "n")
+  
+  axis(1, at = year_ticks, labels = format(year_ticks, "%Y"))
+  
+  points(x_date[grp_k == "H"], df$rho_kendall[grp_k == "H"],
+         pch = 16, col = "blue", cex = 0.8)
+  points(x_date[grp_k == "L"], df$rho_kendall[grp_k == "L"],
+         pch = 16, col = "orange", cex = 0.8)
+  
+  abline(h = 0, col = "royalblue4", lwd = 1)
+  
+  if (!is.null(vline_dates)) {
+    abline(v = vline_dates, col = "grey60", lty = 2)
+  }
+}
+
+# 使用方式
+plot_two_panel_year(rho_results, rho_star = rho_star, vlines = c(4, 8, 12, 16))
+
+
+year_ticks <- seq(
+  from = as.Date("2019-01-01"),
+  to   = as.Date("2022-01-01"),
+  by   = "1 year"
+)
+
+plot(x_date, df$rho_pearson,
+     type = "l",
+     col = "royalblue4",
+     lwd = 1,
+     xlab = "Year",
+     ylab = expression(rho(SR, C)),
+     main = expression(rho(SR, C) ~ "\u2013 Pearson"),
+     ylim = ylim_all,
+     xaxt = "n",
+     xlim = as.Date(c("2019-01-01", "2022-12-31")))
+############################
+# 6. Save results
+############################
+plot_two_panel <- function(df, rho_star = 0.20, vlines = NULL) {
+  
+  oldpar <- par(no.readonly = TRUE)
+  on.exit(par(oldpar))
+  
+  par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+  
+  ylim_all <- range(c(df$rho_pearson, df$rho_kendall, rho_star, 0), na.rm = TRUE)
+  ylim_all <- ylim_all + c(-0.03, 0.03)
+  
+  # ========= 關鍵：cycle 對應年份 =========
+  # 這裡假設每年大約 4 個 cycle（因為 step = 3 months）
+  year_ticks <- c(1, 5, 9, 13)
+  year_labels <- c("2019", "2020", "2021", "2022")
+  
+  # ----- Pearson -----
+  grp_p <- ifelse(df$rho_pearson > rho_star, "H", "L")
+  
+  plot(df$cycle, df$rho_pearson,
+       type = "l",
+       col = "royalblue4",
+       lwd = 1,
+       xlab = "Year",
+       ylab = " ",
+       main = expression(GNV^P),
+       ylim = ylim_all,
+       xaxt = "n")   # 關掉預設 x 軸
+  
+  axis(1, at = year_ticks, labels = year_labels)
+  
+  points(df$cycle[grp_p == "H"], df$rho_pearson[grp_p == "H"],
+         pch = 16, col = "blue", cex = 0.8)
+  points(df$cycle[grp_p == "L"], df$rho_pearson[grp_p == "L"],
+         pch = 16, col = "orange", cex = 0.8)
+  
+  abline(h = 0, col = "royalblue4", lwd = 1)
+  
+  if (!is.null(vlines)) {
+    abline(v = vlines, col = "grey60", lty = 2)
+  }
+  
+  # ----- Kendall -----
+  grp_k <- ifelse(df$rho_kendall > rho_star, "H", "L")
+  
+  plot(df$cycle, df$rho_kendall,
+       type = "l",
+       col = "goldenrod3",
+       lwd = 1,
+       xlab = "Year",
+       ylab = " ",
+       main =expression(GNV^K),
+       ylim = ylim_all,
+       xaxt = "n")
+  
+  axis(1, at = year_ticks, labels = year_labels)
+  
+  points(df$cycle[grp_k == "H"], df$rho_kendall[grp_k == "H"],
+         pch = 16, col = "blue", cex = 0.8)
+  points(df$cycle[grp_k == "L"], df$rho_kendall[grp_k == "L"],
+         pch = 16, col = "orange", cex = 0.8)
+  
+  abline(h = 0, col = "royalblue4", lwd = 1)
+  
+  if (!is.null(vlines)) {
+    abline(v = vlines, col = "grey60", lty = 2)
+  }
+}
+
+plot_two_panel(rho_results, rho_star = rho_star, vlines = vlines_at)
