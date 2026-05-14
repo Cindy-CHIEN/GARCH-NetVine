@@ -1,0 +1,293 @@
+#### ============ 目標說明 ==================== ####
+# 本程式每季重新選股，分別以 Pearson 與 Kendall 的相關係數計算 MST，
+# 並利用 RVine Copula 模型模擬預測報酬，再以切點投資組合（禁止空頭）計算權重。
+# 模擬時分別考慮「最高」與「最低」 eigen centrality 選股，且可設定手續費與否。
+# 最後繪製 x 軸為日期的績效圖。
+
+#### ============ 載入必要套件 ================= ####
+library(igraph)
+library(quantmod)
+library(ape)
+library(VineCopula)
+library(zoo)
+library(sn)
+
+#### ============ 自訂函數：切點投資組合（禁止空頭） ================= ####
+tangency_portfolio_no_short <- function(mean_ret, cov_mat, r_f) {
+  excess_returns <- mean_ret - r_f
+  cov_inv <- solve(cov_mat)
+  numerator <- cov_inv %*% excess_returns
+  denominator <- sum(cov_inv %*% excess_returns)
+  weights <- numerator / denominator
+  weights[weights < 0] <- 0
+  weights <- weights / sum(weights)
+  return(as.numeric(weights))
+}
+#### =========== S&P100 ================= ####
+getSymbols('^OEX', src = "yahoo", from = "2020-01-01", to = "2023-12-31")
+oex_price <- Cl(OEX)
+oex_cumret <- (oex_price / as.numeric(first(oex_price))) 
+OEX.rtn <- na.omit(oex_cumret)
+OEX.rtn<- as.zoo(OEX.rtn)
+#### =========== load data ================= ####
+fee_default <- 0.0002
+
+sp100_tickers <- c(
+  "AAPL","ABBV","ABT","ACN","ADBE","AIG","AMD","AMGN","AMT","AMZN","AVGO","AXP",
+  "BA","BAC","BK","BKNG","BLK","BMY","BRK-B","C","CAT","CHTR","CL","CMCSA","COF",
+  "COP","COST","CRM","CSCO","CVS","CVX","DE","DHR","DIS","DUK","EMR","EXC","F","FDX",
+  "GD","GE","GILD","GM","GOOG","GOOGL","GS","HD","HON","IBM","INTC","JNJ","JPM","KHC",
+  "KO","LIN","LLY","LMT","LOW","MA","MCD","MDLZ","MDT","MET","META","MMM","MO","MRK","MS",
+  "MSFT","NEE","NFLX","NKE","NVDA","ORCL","PEP","PFE","PG","PM","PYPL","QCOM","RTX","SBUX",
+  "SCHW","SO","SPG","T","TGT","TMO","TMUS","TSLA","TXN","UNH","UNP","UPS","USB","V","VZ",
+  "WFC","WMT","XOM"
+)
+start_date <- "2019-01-01"
+end_date   <- "2023-12-31"
+
+# 擷取調整後價格
+getSymbols(sp100_tickers, from = start_date, to = end_date, auto.assign = TRUE)
+sp_prices <- NULL
+for (symbol in sp100_tickers) {
+  sp_prices <- cbind(sp_prices, Ad(get(symbol)))
+}
+colnames(sp_prices) <- sp100_tickers
+
+# 計算每日對數報酬率（注意：diff 後列數少 1）
+log_return <- diff(log(sp_prices))
+log_returns <- log_return[complete.cases(log_return), ]
+
+
+
+
+
+## ===============================================================
+##  相關係數 → 距離  
+## ===============================================================
+if (!exists("corr2dist", mode = "function")) {
+  corr2dist <- function(C, method = c("pearson", "kendall")) {
+    method <- match.arg(method)
+    D <- if (method == "pearson") 1 - C^2 else (1 - C) / 2
+    diag(D) <- 0
+    as.dist(D)
+  }
+}
+
+## ===============================================================
+##  adjacency → T1_edges  
+## ===============================================================
+if (!exists("adj_to_T1", mode = "function")) {
+  adj_to_T1 <- function(adj) {
+    stopifnot(is.matrix(adj),           # 正方形且對稱
+              nrow(adj) == ncol(adj),
+              all(adj == t(adj)),
+              all(diag(adj) == 0))
+    
+    d <- nrow(adj)
+    
+    # 取上三角的 1 → 邊集
+    idx <- which(adj == 1, arr.ind = TRUE)
+    idx <- idx[idx[, "row"] < idx[, "col"], , drop = FALSE]
+    T1_edges <- matrix(as.integer(idx), ncol = 2,
+                       dimnames = list(NULL, c("v1", "v2")))
+    
+    # -------- 合法性：邊數 d-1 且連通 -----------------
+    if (nrow(T1_edges) != d - 1)
+      stop("這張圖的邊數不是 d-1，無法成為樹")
+    
+    if (!requireNamespace("igraph", quietly = TRUE))
+      stop("請先安裝 igraph 套件")
+    
+    g <- igraph::graph_from_edgelist(T1_edges, directed = FALSE)
+    if (!igraph::is_connected(g))       # 新名字
+      stop("這張圖不連通，無法成為樹")
+    
+    T1_edges                           # 全部檢查通過，回傳
+  }
+  
+}
+
+## ===============================================================
+##  rolling 版：simulate_portfolio_fixT1
+## ===============================================================
+simulate_portfolio_fixT1 <- function(corr_method = c("pearson", "kendall"),
+                                     selection   = c("highest", "lowest"),
+                                     fee = fee_default,
+                                     est_length  = 252,
+                                     hold_length = 62,
+                                     shift       = 63,
+                                     top_n       = 20,
+                                     familyset   = 1:6) {
+  
+  corr_method <- match.arg(corr_method)
+  selection   <- match.arg(selection)
+  
+  prices <- sp_prices
+  n_days <- nrow(prices)
+  
+  current_value    <- 1
+  portfolio_values <- numeric()
+  portfolio_dates  <- as.Date(character())
+  adj_list         <- list()
+  
+  i <- 0; cycle <- 1
+  repeat {
+    est_start  <- 1 + i * shift
+    est_end    <- est_start + est_length - 1
+    hold_start <- est_end  + 1
+    hold_end   <- hold_start + hold_length - 1
+    if (est_end > nrow(log_returns) || hold_end > n_days) break
+    
+    ## ---------- (1) 估計期：MST + centrality ----------
+    est_ret <- log_returns[est_start:est_end, ]
+    C_all   <- cor(est_ret, method = corr_method)
+    D_all   <- corr2dist(C_all, corr_method)
+    mst_all <- as.matrix(ape::mst(D_all))
+    
+    g_all <- igraph::graph_from_adjacency_matrix(mst_all, mode = "undirected")
+    ec    <- igraph::eigen_centrality(g_all)$vector
+    pick  <- if (selection == "highest")
+      names(sort(ec, decreasing = TRUE))[1:top_n]
+    else
+      names(sort(ec, decreasing = FALSE))[1:top_n]
+    
+    ## ---------- (2) 對子集合重建 MST  ### <- 修正處
+    C_sub   <- cor(est_ret[, pick], method = corr_method)
+    D_sub   <- corr2dist(C_sub, corr_method)
+    mst_sub <- as.matrix(ape::mst(D_sub))          # 20×20 樹
+    adj_sel <- mst_sub
+    attr(adj_sel, "cycle") <- cycle
+    adj_list[[cycle]] <- adj_sel
+    
+    T1_edges <- adj_to_T1(adj_sel)                 # 19 條
+    
+    ## ---------- (3) vine 模擬 (固定 T1) ----------
+    u_data  <- pobs(est_ret[, pick])
+    vine_mod <- RVineStructureSelect_fixT1(
+      data          = u_data,
+      familyset     = familyset,
+      T1_edges      = T1_edges,
+      selectioncrit = "AIC")
+    
+    sim_u   <- RVineSim(nrow(u_data), vine_mod)
+    
+    ## ---------- (4) ST 逆變換 ----------
+    p <- ncol(u_data)
+    sim_x <- matrix(NA, nrow(u_data), p, dimnames = list(NULL, pick))
+    for (j in seq_len(p)) {
+      x  <- est_ret[, pick[j]]
+      fit <- try(selm(x ~ 1, data.frame(x=x), family="ST",
+                      standardize = FALSE,
+                      control     = list(maxit=500, tol=1e-6)), silent=TRUE)
+      if (inherits(fit,"try-error")) {
+        mu <- mean(x); sg <- sd(x); xi <- 0; nu <- 10
+      } else {
+        dp <- coef(fit, "DP")
+        mu <- ifelse(is.na(dp["xi"]),    mean(x), dp["xi"])
+        sg <- ifelse(is.na(dp["omega"]), sd(x),   dp["omega"])
+        xi <- dp["alpha"]; nu <- dp["nu"]
+      }
+      sim_x[, j] <- qst(sim_u[, j], mean=mu, sd=sg, nu=nu, xi=xi)
+    }
+    
+    ## ---------- (5) 切點投資組合 ----------
+    mean_ret <- colMeans(sim_x, na.rm = TRUE)
+    cov_mat  <- cov(sim_x, use="pairwise.complete.obs")
+    r_f      <- 0.0372 / 252
+    wts      <- tangency_portfolio_no_short(mean_ret, cov_mat, r_f)
+    
+    ## ---------- (6) 持有期追蹤 ----------
+    pr0 <- as.numeric(prices[est_end,    pick])
+    pr1 <- as.numeric(prices[hold_start, pick])
+    V0  <- current_value * sum(wts * (pr1 / pr0)) * (1 - fee)
+    
+    vals <- numeric(hold_length); vals[1] <- V0
+    for (t in (hold_start + 1):hold_end) {
+      pr_t0 <- as.numeric(prices[t - 1, pick])
+      pr_t1 <- as.numeric(prices[t,     pick])
+      vals[t - hold_start + 1] <- vals[t - hold_start] *
+        sum(wts * (pr_t1 / pr_t0))
+    }
+    current_value    <- vals[hold_length]
+    portfolio_values <- c(portfolio_values, vals)
+    portfolio_dates  <- c(portfolio_dates, index(prices)[hold_start:hold_end])
+    
+    message(sprintf("Cycle %d (%s-%s) value: %.4f",
+                    cycle, corr_method, selection, current_value))
+    
+    i <- i + 1; cycle <- cycle + 1
+  }
+  
+  list(dates = as.Date(portfolio_dates),
+       values = portfolio_values,
+       adj    = adj_list)
+}
+
+## ===============================================================
+##  執行四種情境 & 繪圖
+## ===============================================================
+res_P_H <- simulate_portfolio_fixT1("pearson", "highest", fee = fee_default)
+res_P_L <- simulate_portfolio_fixT1("pearson", "lowest",  fee = fee_default)
+res_K_H <- simulate_portfolio_fixT1("kendall", "highest", fee = fee_default)
+res_K_L <- simulate_portfolio_fixT1("kendall", "lowest",  fee = fee_default)
+
+z_vp_h <- zoo(res_P_H$values, order.by = res_P_H$dates)
+z_vp_l <- zoo(res_P_L$values, order.by = res_P_L$dates)
+z_vk_h <- zoo(res_K_H$values, order.by = res_K_H$dates)
+z_vk_l <- zoo(res_K_L$values, order.by = res_K_L$dates)
+
+plot(z_vp_h, type="l", col="blue", lwd=2,
+     xlab="Date", ylab="Portfolio Value", ylim=c(0.5,4),
+     main="(c)")
+lines(z_vp_l, col="orange", lwd=2)
+lines(z_vk_h, col="green",  lwd=2)
+lines(z_vk_l, col="red",    lwd=2)
+lines(OEX.rtn , col="black", lwd=2)
+
+leg <- c(
+  expression(S[1]^{P-H}*"-VC"),
+  expression(S[1]^{P-L}*"-VC"),
+  expression(S[1]^{K-H}*"-VC"),
+  expression(S[1]^{K-L}*"-VC"),
+  "S&P100"
+)
+
+legend("topleft",
+       legend = leg ,
+       text.width = max(strwidth(sapply(leg, deparse), cex = 0.5)),
+       col = c("blue","orange","green","red","black"),
+       lty = 1, lwd = 2, bg = "white")
+
+abline(h=1, col="skyblue2", lty=4, lwd=2)
+
+
+##------------------------------------------------------------
+## 1. 如果沒裝過，先安裝 & 載入 pracma（內含 trapz 函式）
+##------------------------------------------------------------
+# install.packages("pracma")   # ← 只需一次
+library(pracma)
+
+##------------------------------------------------------------
+## 2. 取出 zoo 物件中的 x 與 y，直接套梯形積分
+##------------------------------------------------------------
+AUC <- function(z) {
+  t <- as.numeric(index(z))           # 轉成數值日期
+  y <- coredata(z)
+  trapz(t, y)                         # pracma::trapz
+}
+
+auc_P_H <- AUC(z_vp_h)
+auc_P_L <- AUC(z_vp_l)
+auc_K_H <- AUC(z_vk_h)
+auc_K_L <- AUC(z_vk_l)
+auc_OEX <- AUC(OEX.rtn)               # 基準 S&P 100
+
+##------------------------------------------------------------
+## 3. 彙整成表
+##------------------------------------------------------------
+data.frame(Series = c("P-H-VC", "P-L-VC",
+                      "K-H-VC", "K-L-VC",
+                      "S&P100"),
+           AUC    = round(c(auc_P_H, auc_P_L,
+                            auc_K_H, auc_K_L,
+                            auc_OEX), 3))
